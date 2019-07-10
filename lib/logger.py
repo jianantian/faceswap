@@ -10,9 +10,9 @@ import traceback
 
 from datetime import datetime
 from time import sleep
+from tqdm import tqdm
 
 from lib.queue_manager import queue_manager
-from lib.sysinfo import sysinfo
 
 LOG_QUEUE = queue_manager._log_queue  # pylint: disable=protected-access
 
@@ -44,9 +44,15 @@ class MultiProcessingLogger(logging.Logger):
 
 
 class FaceswapFormatter(logging.Formatter):
-    """ Override formatter to strip newlines and multiple spaces from logger """
+    """ Override formatter to strip newlines and multiple spaces from logger
+        Messages that begin with "R|" should be handled as is
+    """
     def format(self, record):
-        record.msg = re.sub(" +", " ", record.msg.replace("\n", "\\n").replace("\r", "\\r"))
+        if record.msg.startswith("R|"):
+            record.msg = record.msg[2:]
+            record.strip_spaces = False
+        elif record.strip_spaces:
+            record.msg = re.sub(" +", " ", record.msg.replace("\n", "\\n").replace("\r", "\\r"))
         return super().format(record)
 
 
@@ -56,6 +62,13 @@ class RollingBuffer(collections.deque):
         """ Write line to buffer """
         for line in buffer.rstrip().splitlines():
             self.append(line + "\n")
+
+
+class TqdmHandler(logging.StreamHandler):
+    """ Use TQDM Write for outputting to console """
+    def emit(self, record):
+        msg = self.format(record)
+        tqdm.write(msg)
 
 
 def set_root_logger(loglevel=logging.INFO, queue=LOG_QUEUE):
@@ -68,7 +81,7 @@ def set_root_logger(loglevel=logging.INFO, queue=LOG_QUEUE):
     rootlogger.setLevel(loglevel)
 
 
-def log_setup(loglevel, logfile, command):
+def log_setup(loglevel, logfile, command, is_gui=False):
     """ initial log set up. """
     numeric_loglevel = get_loglevel(loglevel)
     root_loglevel = min(logging.DEBUG, numeric_loglevel)
@@ -77,7 +90,7 @@ def log_setup(loglevel, logfile, command):
                                    "%(module)-15s %(funcName)-25s %(levelname)-8s %(message)s",
                                    datefmt="%m/%d/%Y %H:%M:%S")
     f_handler = file_handler(numeric_loglevel, logfile, log_format, command)
-    s_handler = stream_handler(numeric_loglevel)
+    s_handler = stream_handler(numeric_loglevel, is_gui)
     c_handler = crash_handler(log_format)
 
     q_listener = QueueListener(LOG_QUEUE, f_handler, s_handler, c_handler,
@@ -92,7 +105,7 @@ def file_handler(loglevel, logfile, log_format, command):
         filename = logfile
     else:
         filename = os.path.join(os.path.dirname(os.path.realpath(sys.argv[0])), "faceswap")
-        # Windows has issues sharing the log file with subprocesses, so log GUI seperately
+        # Windows has issues sharing the log file with subprocesses, so log GUI separately
         filename += "_gui.log" if command == "gui" else ".log"
 
     should_rotate = os.path.isfile(filename)
@@ -104,21 +117,26 @@ def file_handler(loglevel, logfile, log_format, command):
     return log_file
 
 
-def stream_handler(loglevel):
+def stream_handler(loglevel, is_gui):
     """ Add a logging cli handler """
     # Don't set stdout to lower than verbose
     loglevel = max(loglevel, 15)
     log_format = FaceswapFormatter("%(asctime)s %(levelname)-8s %(message)s",
                                    datefmt="%m/%d/%Y %H:%M:%S")
 
-    log_console = logging.StreamHandler(sys.stdout)
+    if is_gui:
+        # tqdm.write inserts extra lines in the GUI, so use standard output as
+        # it is not needed there.
+        log_console = logging.StreamHandler(sys.stdout)
+    else:
+        log_console = TqdmHandler(sys.stdout)
     log_console.setFormatter(log_format)
     log_console.setLevel(loglevel)
     return log_console
 
 
 def crash_handler(log_format):
-    """ Add a handler that sores the last 50 debug lines to `debug_buffer`
+    """ Add a handler that sores the last 50 debug lines to 'debug_buffer'
         for use in crash reports """
     log_crash = logging.StreamHandler(debug_buffer)
     log_crash.setFormatter(log_format)
@@ -137,6 +155,7 @@ def get_loglevel(loglevel):
 
 def crash_log():
     """ Write debug_buffer to a crash log on crash """
+    from lib.sysinfo import sysinfo
     path = os.getcwd()
     filename = os.path.join(path, datetime.now().strftime("crash_report.%Y.%m.%d.%H%M%S%f.log"))
 
@@ -148,9 +167,21 @@ def crash_log():
     with open(filename, "w") as outfile:
         outfile.writelines(freeze_log)
         traceback.print_exc(file=outfile)
-        outfile.write(sysinfo.full_info())
+        outfile.write(sysinfo)
     return filename
 
+
+old_factory = logging.getLogRecordFactory()  # pylint: disable=invalid-name
+
+
+def faceswap_logrecord(*args, **kwargs):
+    """ Add a flag to logging.LogRecord to not strip formatting from particular records """
+    record = old_factory(*args, **kwargs)
+    record.strip_spaces = True
+    return record
+
+
+logging.setLogRecordFactory(faceswap_logrecord)
 
 # Set logger class to custom logger
 logging.setLoggerClass(MultiProcessingLogger)
